@@ -1,3 +1,8 @@
+# outputs/
+nohups/
+gs_data/
+# gs_data.tar.gz
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -204,3 +209,4 @@ exp/
 !threestudio/utils/wonder3D/mvdiffusion/data
 tmp_add/
 .idea/
+gs_data.tar.gz

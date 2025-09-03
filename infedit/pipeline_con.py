@@ -107,7 +107,7 @@ class EditConsistPipeline(EditPipeline):
             latents = latents[0][None].repeat(latents.shape[0], 1, 1, 1)
 
         source_latents = latents
-        mutual_latents = latents
+        mutual_latents = latents 
 
         # 7. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -127,7 +127,7 @@ class EditConsistPipeline(EditPipeline):
                 if (step_idx + 1) % attn_ctrl_steps == 0:
                     print(f'Cross-Attention Consistency Control at t = {t} ...')
                     toy_controllers = [copy.deepcopy(controller) for controller in controllers]
-                    for idx in range(len(latents)):
+                    for idx in range(len(latents)): ## len(latents) = len(view_list)
 
                         # get latents
                         latent = latents[idx][None]
@@ -135,7 +135,7 @@ class EditConsistPipeline(EditPipeline):
                         mutual_latent = mutual_latents[idx][None]
 
                         # register the controller
-                        controller = toy_controllers[idx]
+                        controller = toy_controllers[idx] ## 뷰마다 컨트롤러 등록
                         register_attention_control(self, controller)
 
                         # expand the latents if we are doing classifier free guidance
@@ -175,6 +175,7 @@ class EditConsistPipeline(EditPipeline):
                             dim=0,
                         )  # 0 is unconditional prompt, 1 is conditional prompt
 
+                        ## 3. U-Net 실행 (attention controller가 자동으로 attention 맵 수집)
                         _ = self.unet(
                             concat_latent_model_input,
                             t,
@@ -320,10 +321,13 @@ class EditConsistPipeline(EditPipeline):
                     )
 
                     # all the latents here are not used for computing
+                    ## -> DDCM sampler가 출력한 latent들이 다음 계산에서 사용되지 않는다
+                    # pred_x0, alpha_prod_t_prev, pred_mu0 는 추후에 사용된다
+                    
                     _, latent, pred_x0, _ = ddcm_sampler(
                         self.scheduler, source_latent,
                         latent, t,
-                        source_noise_pred, noise_pred,
+                        source_noise_pred, noise_pred, ## Target Branch와 Source Branch를 DDCM으로 합침
                         clean_latent, noise=noise,
                         eta=eta, to_next=False,
                         **extra_step_kwargs
@@ -339,12 +343,83 @@ class EditConsistPipeline(EditPipeline):
                         **extra_step_kwargs
                     )
 
-                    view_preds.append(torch.cat([pred_x0, pred_mu0], dim=1))
+                    view_preds.append(torch.cat([pred_x0, pred_mu0], dim=1)) # view_preds: empty []
                 view_preds = torch.cat(view_preds, dim=0)
 
                 for controller in controllers:
                     controller.reset_consist()
                     controller.disable_consist()
+
+                # 디버깅용: view_img_preds 저장
+                DEBUG_SAVE_INTERMEDIATE = True  # 이 flag를 True로 설정하면 중간 결과 저장
+                if DEBUG_SAVE_INTERMEDIATE:
+                    try:
+                        import os
+                        from PIL import Image
+                        import numpy as np
+                        debug_dir = "debug_intermediate_results"
+                        os.makedirs(debug_dir, exist_ok=True)
+                        
+                        print("DEBuG")
+                        # view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]), ## latent에서 image로 디코딩
+                                                    # self.decode_batches(view_preds[:, 4:])], dim=1)
+                        view_img_preds = self.decode_batches(view_preds[:, :4])
+
+                        view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32) # rgb
+                        print(f"view_img_preds shape!!!: {view_img_preds.shape}") # [96, 3, 512, 512]
+
+
+                        
+                        # view_img_preds를 이미지로 저장
+                        for i in range(view_img_preds.shape[0]):  # 96개 뷰
+                            img = view_img_preds[i].detach().cpu().numpy()  # [3, 512, 512]
+                            
+                            # view_img_preds shape: [96, 3, 512, 512] - RGB 이미지
+                            # [3, 512, 512] → [512, 512, 3] RGB로 변환
+                            if len(img.shape) == 3 and img.shape[0] == 3:  # [3, H, W]
+                                img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
+                            
+                            # 값 범위를 0-255로 변환
+                            if img.max() <= 1.0:
+                                img = (img * 255).astype(np.uint8)
+                            else:
+                                img = img.astype(np.uint8)
+                            
+                            # RGB 값 범위 제한
+                            img = np.clip(img, 0, 255)
+                            
+                            pil_img = Image.fromarray(img)
+                            filename = f"{debug_dir}/step_{step_idx}_t_{t}_view_{i}.png"
+                            pil_img.save(filename)
+                            print(f"✓ Saved: {filename} (shape: {img.shape}, range: {img.min()}-{img.max()})")
+                        
+                        print(f"✓ All intermediate results saved to {debug_dir}/")
+                        
+                    except Exception as e:
+                        print(f"⚠️  Warning: Failed to save intermediate results: {e}")
+                
+                # 여기서 중단하고 싶다면 이 flag를 True로 설정
+                DEBUG_STOP_HERE = True  # 이 flag를 True로 설정하면 여기서 중단
+                if DEBUG_STOP_HERE:
+                    print("🛑 DEBUG_STOP_HERE flag is True. Stopping execution here.")
+                    print(f"view_img_preds shape: {view_img_preds.shape}") # [96, 6, 512, 512]
+                    print(f"view_img_preds dtype: {view_img_preds.dtype}")
+                    print(f"view_img_preds device: {view_img_preds.device}") 
+                    print(f"view_img_preds min: {view_img_preds.min()}, max: {view_img_preds.max()}")
+                    
+                    # 추가 디버깅 정보
+                    print(f"view_img_preds[0, 0] shape: {view_img_preds[0, 0].shape}")
+                    print(f"view_img_preds[0, 0] dtype: {view_img_preds[0, 0].dtype}")
+                    print(f"view_img_preds[0, 0] min: {view_img_preds[0, 0].min()}, max: {view_img_preds[0, 0].max()}")
+                    
+                    # 첫 번째 이미지의 샘플 값들 확인
+                    sample_img = view_img_preds[0, 0].detach().cpu().numpy()
+                    print(f"Sample image shape: {sample_img.shape}")
+                    print(f"Sample image first few values: {sample_img.flatten()[:10]}")
+                    
+                    return {"debug_stopped": True, "view_img_preds": view_img_preds}
+
+
 
                 # 8.3. prediction consistency control
                 # ================== consist control for pred_x0 and pred_mu0 ==================
@@ -353,9 +428,11 @@ class EditConsistPipeline(EditPipeline):
                     # inverse project images to 3d
                     print(f'Prediction Consistency Control at t = {t} ...')
                     print(f'--step 1: inverse project images to 3d ...')
-                    view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]),
+                    view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]), ## latent에서 image로 디코딩
                                                 self.decode_batches(view_preds[:, 4:])], dim=1)
-                    view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32)
+                    view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32) # rgb
+
+
 
                     gaussian_color_x0 = self.mini_gaussian_training(copy.deepcopy(gaussian), view_list,
                                                                  view_img_preds[:, :3],  cameras,
