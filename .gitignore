@@ -1,7 +1,10 @@
 # outputs/
 nohups/
 gs_data/
-# gs_data.tar.gz
+gs_data.tar.gz
+degug_intermediate_results/
+outputs/
+edit_cache/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
