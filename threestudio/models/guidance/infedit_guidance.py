@@ -168,9 +168,10 @@ class InfEditGuidance(BaseObject):
                        strength=1,
                        guidance_scale=self.cfg.guidance_scale,
                        source_guidance_scale=1,
-                       denoise_model=False,
+                        denoise_model=False,
                         controllers=controllers,
-                       callbacks=[controller.step_callback for controller in controllers]
+                       callbacks=[controller.step_callback for controller in controllers],
+                       attn_projection_resolution=self.cfg.attn_projection_resolution,
                        )
 
         edit_images = results.images

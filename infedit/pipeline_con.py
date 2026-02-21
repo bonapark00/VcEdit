@@ -1,4 +1,6 @@
 import copy
+import os
+import time
 
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -117,6 +119,13 @@ class EditConsistPipeline(EditPipeline):
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for step_idx, t in enumerate(timesteps):
+                # timing: initialize per-iteration timers
+                iter_start_time = time.time()
+                attn_ctrl_time = 0.0
+                forward_time = 0.0
+                pred_ctrl_time = 0.0
+                blend_ctrl_time = 0.0
+                update_time = 0.0
 
                 noise = torch.randn(
                     latents[:1].shape,
@@ -125,8 +134,18 @@ class EditConsistPipeline(EditPipeline):
 
                 # 8.1. cross attention consistency control
                 if (step_idx + 1) % attn_ctrl_steps == 0:
+                    _attn_start = time.time()
                     print(f'Cross-Attention Consistency Control at t = {t} ...')
+                    
+                    # Initialize detailed timing
+                    attn_unet_time = 0.0
+                    attn_projection_rendering_time = 0.0
+                    attn_cleanup_time = 0.0
+                    
                     toy_controllers = [copy.deepcopy(controller) for controller in controllers]
+                    
+                    # U-Net execution timing
+                    _unet_start = time.time()
                     for idx in range(len(latents)): ## len(latents) = len(view_list)
 
                         # get latents
@@ -182,7 +201,10 @@ class EditConsistPipeline(EditPipeline):
                             cross_attention_kwargs=cross_attention_kwargs,
                             encoder_hidden_states=concat_prompt_embeds,
                         ).sample
+                    attn_unet_time += time.time() - _unet_start
 
+                    # Projection and rendering timing
+                    _proj_render_start = time.time()
                     # project and average the attn maps
                     attn_len = max(prompt_token_len, source_prompt_token_len)
                     attn_dtype = concat_latent_model_input.dtype
@@ -195,7 +217,7 @@ class EditConsistPipeline(EditPipeline):
                                 view_attn = toy_controllers[idx].consist_store[module_name][attn_idx][:, :, :attn_len]
                                 attn_size = int(view_attn.shape[1] ** 0.5)
                                 view_attn = view_attn.reshape(-1, attn_size, attn_size, attn_len).permute(0, 3, 1, 2)
-                                view_attn = F.interpolate(view_attn, size=(512, 512), mode="bilinear", align_corners=False)
+                                view_attn = F.interpolate(view_attn, size=(attn_projection_resolution, attn_projection_resolution), mode="bilinear", align_corners=False)
                                 view_attn = view_attn.flatten(0, 1).to(torch.float32)
                                 all_view_attn.append(view_attn)
 
@@ -208,7 +230,8 @@ class EditConsistPipeline(EditPipeline):
                                                          device="cuda")
                                 for idx, view_idx in enumerate(view_list):
                                     gaussian.apply_weights(cameras[view_idx], weight, weight_cnt,
-                                                           all_view_attn[idx][c_idx][None])
+                                                           all_view_attn[idx][c_idx][None],
+                                                           projection_size=(attn_projection_resolution, attn_projection_resolution))
                                 point_attn.append(weight)
                                 point_attn_cnt.append(weight_cnt)
                             point_attn = torch.cat(point_attn, dim=-1)
@@ -244,12 +267,32 @@ class EditConsistPipeline(EditPipeline):
 
                             del con_view_attn, point_attn, point_attn_cnt
                             torch.cuda.empty_cache()
+                    attn_projection_rendering_time += time.time() - _proj_render_start
+                    
+                    # Cleanup timing
+                    _cleanup_start = time.time()
                     for controller in controllers:
                         controller.enable_consist()
                     del toy_controllers
                     torch.cuda.empty_cache()
+                    attn_cleanup_time += time.time() - _cleanup_start
+                    
+                    attn_ctrl_time += time.time() - _attn_start
+                    
+                    # Store detailed timing for CSV logging
+                    self._attn_unet_time = attn_unet_time
+                    self._attn_projection_rendering_time = attn_projection_rendering_time
+                    self._attn_cleanup_time = attn_cleanup_time
+                    
+                    # Log detailed cross-attention timing
+                    print(f'  Cross-Attention Detailed Timing:')
+                    print(f'    U-Net execution: {attn_unet_time:.3f}s')
+                    print(f'    Projection + Rendering: {attn_projection_rendering_time:.3f}s')
+                    print(f'    Cleanup: {attn_cleanup_time:.3f}s')
+                    print(f'    Total: {attn_ctrl_time:.3f}s')
 
                 # 8.2. forward each view
+                _forward_start = time.time()
                 view_preds = []
                 for idx in range(len(latents)):
 
@@ -349,81 +392,15 @@ class EditConsistPipeline(EditPipeline):
                 for controller in controllers:
                     controller.reset_consist()
                     controller.disable_consist()
+                forward_time += time.time() - _forward_start
 
-                # 디버깅용: view_img_preds 저장
-                DEBUG_SAVE_INTERMEDIATE = True  # 이 flag를 True로 설정하면 중간 결과 저장
-                if DEBUG_SAVE_INTERMEDIATE:
-                    try:
-                        import os
-                        from PIL import Image
-                        import numpy as np
-                        debug_dir = "debug_intermediate_results"
-                        os.makedirs(debug_dir, exist_ok=True)
-                        
-                        print("DEBuG")
-                        # view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]), ## latent에서 image로 디코딩
-                                                    # self.decode_batches(view_preds[:, 4:])], dim=1)
-                        view_img_preds = self.decode_batches(view_preds[:, :4])
-
-                        view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32) # rgb
-                        print(f"view_img_preds shape!!!: {view_img_preds.shape}") # [96, 3, 512, 512]
-
-
-                        
-                        # view_img_preds를 이미지로 저장
-                        for i in range(view_img_preds.shape[0]):  # 96개 뷰
-                            img = view_img_preds[i].detach().cpu().numpy()  # [3, 512, 512]
-                            
-                            # view_img_preds shape: [96, 3, 512, 512] - RGB 이미지
-                            # [3, 512, 512] → [512, 512, 3] RGB로 변환
-                            if len(img.shape) == 3 and img.shape[0] == 3:  # [3, H, W]
-                                img = np.transpose(img, (1, 2, 0))  # [H, W, 3]
-                            
-                            # 값 범위를 0-255로 변환
-                            if img.max() <= 1.0:
-                                img = (img * 255).astype(np.uint8)
-                            else:
-                                img = img.astype(np.uint8)
-                            
-                            # RGB 값 범위 제한
-                            img = np.clip(img, 0, 255)
-                            
-                            pil_img = Image.fromarray(img)
-                            filename = f"{debug_dir}/step_{step_idx}_t_{t}_view_{i}.png"
-                            pil_img.save(filename)
-                            print(f"✓ Saved: {filename} (shape: {img.shape}, range: {img.min()}-{img.max()})")
-                        
-                        print(f"✓ All intermediate results saved to {debug_dir}/")
-                        
-                    except Exception as e:
-                        print(f"⚠️  Warning: Failed to save intermediate results: {e}")
-                
-                # 여기서 중단하고 싶다면 이 flag를 True로 설정
-                DEBUG_STOP_HERE = True  # 이 flag를 True로 설정하면 여기서 중단
-                if DEBUG_STOP_HERE:
-                    print("🛑 DEBUG_STOP_HERE flag is True. Stopping execution here.")
-                    print(f"view_img_preds shape: {view_img_preds.shape}") # [96, 6, 512, 512]
-                    print(f"view_img_preds dtype: {view_img_preds.dtype}")
-                    print(f"view_img_preds device: {view_img_preds.device}") 
-                    print(f"view_img_preds min: {view_img_preds.min()}, max: {view_img_preds.max()}")
-                    
-                    # 추가 디버깅 정보
-                    print(f"view_img_preds[0, 0] shape: {view_img_preds[0, 0].shape}")
-                    print(f"view_img_preds[0, 0] dtype: {view_img_preds[0, 0].dtype}")
-                    print(f"view_img_preds[0, 0] min: {view_img_preds[0, 0].min()}, max: {view_img_preds[0, 0].max()}")
-                    
-                    # 첫 번째 이미지의 샘플 값들 확인
-                    sample_img = view_img_preds[0, 0].detach().cpu().numpy()
-                    print(f"Sample image shape: {sample_img.shape}")
-                    print(f"Sample image first few values: {sample_img.flatten()[:10]}")
-                    
-                    return {"debug_stopped": True, "view_img_preds": view_img_preds}
-
+              
 
 
                 # 8.3. prediction consistency control
                 # ================== consist control for pred_x0 and pred_mu0 ==================
                 if (step_idx + 1) % pred_ctrl_steps == 0:
+                    _pred_start = time.time()
 
                     # inverse project images to 3d
                     print(f'Prediction Consistency Control at t = {t} ...')
@@ -477,9 +454,11 @@ class EditConsistPipeline(EditPipeline):
 
                     del gaussian_color_x0, gaussian_color_mu0, con_view_preds_x0, con_view_preds_mu0
                     torch.cuda.empty_cache()
+                    pred_ctrl_time += time.time() - _pred_start
 
                 # 8.4. blending map consistency control
                 # ================== consist control for blend maps ==================
+                _blend_start = time.time()
                 maps = []
                 for idx, view_idx in enumerate(view_list):
                     maps.append(controllers[idx].local_blend.get_blend_maps(controllers[idx].attention_store,
@@ -489,14 +468,15 @@ class EditConsistPipeline(EditPipeline):
                 if (step_idx + 1) % blend_ctrl_steps == 0:
                     print(f'Blend Cross-Attention Consistency Control at t = {t} ...')
                     print(f'--step 1: inverse project maps to 3d ...')
-                    maps = F.interpolate(maps, size=(512, 512))
+                    maps = F.interpolate(maps, size=(attn_projection_resolution, attn_projection_resolution))
                     point_maps = []
                     point_maps_cnt = []
                     for c_idx in range(maps.shape[1]):
                         weight = torch.zeros((gaussian.get_opacity.shape[0], 1), dtype=torch.float32, device="cuda")
                         weight_cnt = torch.zeros((gaussian.get_opacity.shape[0],), dtype=torch.int, device="cuda")
                         for idx, view_idx in enumerate(view_list):
-                            gaussian.apply_weights(cameras[view_idx], weight, weight_cnt, maps[idx][c_idx][None])
+                            gaussian.apply_weights(cameras[view_idx], weight, weight_cnt, maps[idx][c_idx][None],
+                                                   projection_size=(attn_projection_resolution, attn_projection_resolution))
                         point_maps.append(weight)
                         point_maps_cnt.append(weight_cnt)
                     point_maps = torch.cat(point_maps, dim=-1)
@@ -510,10 +490,12 @@ class EditConsistPipeline(EditPipeline):
                                            bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))['render'])
 
                     maps = F.interpolate(torch.stack(maps, dim=0), size=(view_preds.shape[-2], view_preds.shape[-1]))
+                blend_ctrl_time += time.time() - _blend_start
 
                 # 8.5. update latents and call callback
                 # ================== update latents and call callback ==================
                 print(f'Update Latents & Callback at t = {t} ...')
+                _update_start = time.time()
                 latents = []
                 mutual_latents = []
                 source_latents = []
@@ -554,6 +536,45 @@ class EditConsistPipeline(EditPipeline):
                 del maps, view_preds
                 torch.cuda.empty_cache()
 
+                # write per-iteration timing ratios
+                update_time += time.time() - _update_start
+                iter_total_time = time.time() - iter_start_time
+                accounted = attn_ctrl_time + forward_time + pred_ctrl_time + blend_ctrl_time + update_time
+                other_time = max(0.0, iter_total_time - accounted)
+
+                timing_dir = os.environ.get("VCEDIT_TIMING_DIR", None)
+                if timing_dir is None:
+                    # fallback: try to use threestudio trial_dir if available via system attribute, else CWD
+                    try:
+                        timing_dir = getattr(self, "trial_dir", os.getcwd())
+                    except Exception:
+                        timing_dir = os.getcwd()
+                try:
+                    os.makedirs(timing_dir, exist_ok=True)
+                    iter_csv = os.path.join(timing_dir, "timings_iter.csv")
+                    write_header = not os.path.exists(iter_csv)
+                    with open(iter_csv, "a") as f:
+                        if write_header:
+                            f.write("step,t,iter_total,attn_ctrl,attn_unet,attn_projection_rendering,attn_cleanup,forward,pred_ctrl,blend_ctrl,update,other,attn_ratio,attn_unet_ratio,attn_projection_rendering_ratio,attn_cleanup_ratio,forward_ratio,pred_ratio,blend_ratio,update_ratio,other_ratio\n")
+                        # compute ratios
+                        def r(x):
+                            return (x / iter_total_time) if iter_total_time > 0 else 0.0
+                        # Get detailed attn timing if available
+                        attn_unet_time = getattr(self, '_attn_unet_time', 0.0)
+                        attn_projection_rendering_time = getattr(self, '_attn_projection_rendering_time', 0.0)
+                        attn_cleanup_time = getattr(self, '_attn_cleanup_time', 0.0)
+                        
+                        line = (
+                            f"{step_idx},{int(t)},"
+                            f"{iter_total_time:.6f},{attn_ctrl_time:.6f},{attn_unet_time:.6f},{attn_projection_rendering_time:.6f},{attn_cleanup_time:.6f},"
+                            f"{forward_time:.6f},{pred_ctrl_time:.6f},{blend_ctrl_time:.6f},{update_time:.6f},{other_time:.6f},"
+                            f"{r(attn_ctrl_time):.6f},{r(attn_unet_time):.6f},{r(attn_projection_rendering_time):.6f},{r(attn_cleanup_time):.6f},"
+                            f"{r(forward_time):.6f},{r(pred_ctrl_time):.6f},{r(blend_ctrl_time):.6f},{r(update_time):.6f},{r(other_time):.6f}\n"
+                        )
+                        f.write(line)
+                except Exception as _:
+                    pass
+
         # 9. Post-processing
         if not output_type == "latent":
             image = self.decode_batches(all_pred_x0)
@@ -570,6 +591,55 @@ class EditConsistPipeline(EditPipeline):
 
         if not return_dict:
             return image
+
+        # write final aggregate timing summary by reading the per-iteration CSV
+        try:
+            timing_dir = os.environ.get("VCEDIT_TIMING_DIR", None)
+            if timing_dir is None:
+                try:
+                    timing_dir = getattr(self, "trial_dir", os.getcwd())
+                except Exception:
+                    timing_dir = os.getcwd()
+            iter_csv = os.path.join(timing_dir, "timings_iter.csv")
+            summary_txt = os.path.join(timing_dir, "timings_summary.txt")
+            if os.path.exists(iter_csv):
+                total = 0.0
+                attn = attn_unet = attn_projection_rendering = attn_cleanup = 0.0
+                forward = pred = blend = update_sum = other = 0.0
+                with open(iter_csv, "r") as f:
+                    header = True
+                    for line in f:
+                        if header:
+                            header = False
+                            continue
+                        parts = line.strip().split(",")
+                        if len(parts) < 19:  # Updated for new CSV format
+                            continue
+                        total += float(parts[2])
+                        attn += float(parts[3])
+                        attn_unet += float(parts[4])
+                        attn_projection_rendering += float(parts[5])
+                        attn_cleanup += float(parts[6])
+                        forward += float(parts[7])
+                        pred += float(parts[8])
+                        blend += float(parts[9])
+                        update_sum += float(parts[10])
+                        other += float(parts[11])
+                denom = max(total, 1e-8)
+                with open(summary_txt, "w") as f:
+                    f.write("Final Timing Summary (seconds and ratios)\n")
+                    f.write(f"total={total:.6f}\n")
+                    f.write(f"attn_ctrl={attn:.6f}, ratio={attn/denom:.6f}\n")
+                    f.write(f"  attn_unet={attn_unet:.6f}, ratio={attn_unet/denom:.6f}\n")
+                    f.write(f"  attn_projection_rendering={attn_projection_rendering:.6f}, ratio={attn_projection_rendering/denom:.6f}\n")
+                    f.write(f"  attn_cleanup={attn_cleanup:.6f}, ratio={attn_cleanup/denom:.6f}\n")
+                    f.write(f"forward={forward:.6f}, ratio={forward/denom:.6f}\n")
+                    f.write(f"pred_ctrl={pred:.6f}, ratio={pred/denom:.6f}\n")
+                    f.write(f"blend_ctrl={blend:.6f}, ratio={blend/denom:.6f}\n")
+                    f.write(f"update={update_sum:.6f}, ratio={update_sum/denom:.6f}\n")
+                    f.write(f"other={other:.6f}, ratio={other/denom:.6f}\n")
+        except Exception as _:
+            pass
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=nsfw_content_detected)
 

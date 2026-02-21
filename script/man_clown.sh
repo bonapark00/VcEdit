@@ -1,6 +1,6 @@
 python launch.py --config configs/edit-inf.yaml \
 --train \
---gpu 0 \
+--gpu 2 \
 system.max_densify_percent=0.01 \
 system.anchor_weight_init_g0=0.05 \
 system.anchor_weight_init=0.1 \

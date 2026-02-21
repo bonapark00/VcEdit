@@ -47,7 +47,7 @@ def preprocess(image):
         image = torch.cat(image, dim=0)
     return image
 
-
+## Dual Diffusion Consistency Model (DDCM) Sampler
 def ddcm_sampler(scheduler, x_s, x_t, timestep, e_s, e_t, x_0, noise, eta, to_next=True):
     if scheduler.num_inference_steps is None:
         raise ValueError(
