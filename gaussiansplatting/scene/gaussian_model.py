@@ -815,13 +815,10 @@ class GaussianModel:
         )
         self.denom[update_filter] += 1
 
-    def apply_weights(self, camera, weights, weights_cnt, image_weights, projection_size=None):
-        bg = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
-        if projection_size is not None:
-            h, w = int(projection_size[0]), int(projection_size[1])
-            rasterizer = camera2rasterizer_with_size(camera, bg, h, w)
-        else:
-            rasterizer = camera2rasterizer(camera, bg)
+    def apply_weights(self, camera, weights, weights_cnt, image_weights):
+        rasterizer = camera2rasterizer(
+            camera, torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+        )
         rasterizer.apply_weights(
             self.get_xyz,
             None,

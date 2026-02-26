@@ -1,6 +1,5 @@
 import copy
 import os
-import time
 
 from torch.utils.data import Dataset, DataLoader
 import torch.nn.functional as F
@@ -16,6 +15,7 @@ from diffusers.pipelines.stable_diffusion import StableDiffusionPipelineOutput
 from .ptp_utils import register_attention_control
 from gaussiansplatting.gaussian_renderer import render
 from threestudio.utils.perceptual import PerceptualLoss
+from threestudio.utils.latency import LatencyLogger
 
 
 class EditConsistPipeline(EditPipeline):
@@ -51,6 +51,7 @@ class EditConsistPipeline(EditPipeline):
             callback_steps: int = 1,
             cross_attention_kwargs: Optional[Dict[str, Any]] = None,
             denoise_model: Optional[bool] = True,
+            attn_projection_resolution: int = 512,
     ):
         # 1. Check inputs
         self.check_inputs(prompt, strength, callback_steps)
@@ -116,17 +117,17 @@ class EditConsistPipeline(EditPipeline):
         generator = extra_step_kwargs.pop("generator", None)
 
         # 8. Denoising loop
+        timing_dir = os.environ.get("VCEDIT_TIMING_DIR", None)
+        if timing_dir is None:
+            try:
+                timing_dir = getattr(self, "trial_dir", os.getcwd())
+            except Exception:
+                timing_dir = os.getcwd()
+        latency_logger = LatencyLogger(timing_dir)
+
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for step_idx, t in enumerate(timesteps):
-                # timing: initialize per-iteration timers
-                iter_start_time = time.time()
-                attn_ctrl_time = 0.0
-                forward_time = 0.0
-                pred_ctrl_time = 0.0
-                blend_ctrl_time = 0.0
-                update_time = 0.0
-
                 noise = torch.randn(
                     latents[:1].shape,
                     dtype=latents.dtype, device=latents.device, generator=generator
@@ -134,27 +135,145 @@ class EditConsistPipeline(EditPipeline):
 
                 # 8.1. cross attention consistency control
                 if (step_idx + 1) % attn_ctrl_steps == 0:
-                    _attn_start = time.time()
-                    print(f'Cross-Attention Consistency Control at t = {t} ...')
-                    
-                    # Initialize detailed timing
-                    attn_unet_time = 0.0
-                    attn_projection_rendering_time = 0.0
-                    attn_cleanup_time = 0.0
-                    
-                    toy_controllers = [copy.deepcopy(controller) for controller in controllers]
-                    
-                    # U-Net execution timing
-                    _unet_start = time.time()
-                    for idx in range(len(latents)): ## len(latents) = len(view_list)
+                    with latency_logger.timeit("inference.attn_ctrl"):
+                        print(f'Cross-Attention Consistency Control at t = {t} ...')
 
+                        toy_controllers = [copy.deepcopy(controller) for controller in controllers]
+
+                        with latency_logger.timeit("inference.attn_ctrl.unet"):
+                            for idx in range(len(latents)): ## len(latents) = len(view_list)
+                                # get latents
+                                latent = latents[idx][None]
+                                source_latent = source_latents[idx][None]
+                                mutual_latent = mutual_latents[idx][None]
+
+                                # register the controller
+                                controller = toy_controllers[idx] ## 뷰마다 컨트롤러 등록
+                                register_attention_control(self, controller)
+
+                                # expand the latents if we are doing classifier free guidance
+                                latent_model_input = torch.cat([latent] * 2) if do_classifier_free_guidance else latent
+                                source_latent_model_input = (
+                                    torch.cat([source_latent] * 2) if do_classifier_free_guidance else source_latent
+                                )
+                                mutual_latent_model_input = (
+                                    torch.cat([mutual_latent] * 2) if do_classifier_free_guidance else mutual_latent
+                                )
+                                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                                source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
+                                mutual_latent_model_input = self.scheduler.scale_model_input(mutual_latent_model_input, t)
+
+                                # predict the noise residual
+                                assert do_classifier_free_guidance
+                                concat_latent_model_input = torch.stack(  # source_latent is same initialized as tgt_latent
+                                    [
+                                        source_latent_model_input[0],
+                                        latent_model_input[0],
+                                        mutual_latent_model_input[0],  # mutual latents, the latent of the middle branch
+                                        source_latent_model_input[1],
+                                        latent_model_input[1],
+                                        mutual_latent_model_input[1],  # mutual latents, which plays as a middle results
+                                    ],
+                                    dim=0,
+                                )  # 0 is unconditional latent, 1 is conditional latent, 0/1 is same initialized
+                                concat_prompt_embeds = torch.stack(
+                                    [
+                                        source_prompt_embeds[0],
+                                        prompt_embeds[0],
+                                        source_prompt_embeds[0],
+                                        source_prompt_embeds[1],
+                                        prompt_embeds[1],
+                                        source_prompt_embeds[1],
+                                    ],
+                                    dim=0,
+                                )  # 0 is unconditional prompt, 1 is conditional prompt
+
+                                ## 3. U-Net 실행 (attention controller가 자동으로 attention 맵 수집)
+                                _ = self.unet(
+                                    concat_latent_model_input,
+                                    t,
+                                    cross_attention_kwargs=cross_attention_kwargs,
+                                    encoder_hidden_states=concat_prompt_embeds,
+                                ).sample
+
+                        with latency_logger.timeit("inference.attn_ctrl.projection_rendering"):
+                            attn_len = max(prompt_token_len, source_prompt_token_len)
+                            attn_dtype = concat_latent_model_input.dtype
+                            for module_name, attn_list in toy_controllers[0].consist_store.items():
+                                if len(attn_list) == 0:
+                                    continue
+                                for attn_idx in tqdm(range(len(attn_list))):
+                                    all_view_attn = []
+                                    for idx in range(len(view_list)):
+                                        view_attn = toy_controllers[idx].consist_store[module_name][attn_idx][:, :, :attn_len]
+                                        attn_size = int(view_attn.shape[1] ** 0.5)
+                                        view_attn = view_attn.reshape(-1, attn_size, attn_size, attn_len).permute(0, 3, 1, 2)
+                                        view_attn = F.interpolate(view_attn, size=(attn_projection_resolution, attn_projection_resolution), mode="bilinear", align_corners=False)
+                                        view_attn = view_attn.flatten(0, 1).to(torch.float32)
+                                        all_view_attn.append(view_attn)
+
+                                    point_attn = []
+                                    point_attn_cnt = []
+                                    for c_idx in range(view_attn.shape[0]):
+                                        weight = torch.zeros((gaussian.get_opacity.shape[0], 1), dtype=torch.float32,
+                                                             device="cuda")
+                                        weight_cnt = torch.zeros((gaussian.get_opacity.shape[0],), dtype=torch.int,
+                                                                 device="cuda")
+                                        for idx, view_idx in enumerate(view_list):
+                                            gaussian.apply_weights(cameras[view_idx], weight, weight_cnt,
+                                                                   all_view_attn[idx][c_idx][None])
+                                        point_attn.append(weight)
+                                        point_attn_cnt.append(weight_cnt)
+                                    point_attn = torch.cat(point_attn, dim=-1)
+                                    point_attn_cnt = torch.stack(point_attn_cnt, dim=-1)
+                                    point_attn = point_attn / (point_attn_cnt + 1e-8)
+
+                                    del all_view_attn
+                                    torch.cuda.empty_cache()
+
+                                    con_view_attn = []
+                                    assert point_attn.shape[1] % 3 == 0
+                                    for c_idx in range(point_attn.shape[1] // 3):
+                                        point_attn_ = point_attn[:, c_idx * 3:(c_idx + 1) * 3]
+                                        con_view_attn_ = []
+                                        for idx, view_idx in enumerate(view_list):
+                                            con_view_attn_.append(render(cameras[view_idx], gaussian, render_pipe,
+                                                                         override_color=point_attn_,
+                                                                         bg_color=torch.tensor([0, 0, 0], dtype=torch.float32,
+                                                                                               device="cuda"))['render'])
+                                        con_view_attn.append(torch.stack(con_view_attn_, dim=0))
+                                    con_view_attn = torch.cat(con_view_attn, dim=1)
+
+                                    con_view_attn = F.interpolate(con_view_attn, size=(attn_size, attn_size),
+                                                                  mode="bilinear", align_corners=False)
+                                    con_view_attn = con_view_attn.reshape(len(view_list), -1, attn_len, attn_size, attn_size
+                                                                          ).permute(0, 1, 3, 4, 2).flatten(2, 3)
+                                    for idx, view_idx in enumerate(view_list):
+                                        toy_controllers[idx].consist_store[module_name][attn_idx][:, :, :attn_len] = con_view_attn[idx]
+                                        controllers[idx].consist_store[module_name].append(copy.deepcopy(
+                                            toy_controllers[idx].consist_store[module_name][attn_idx].to(attn_dtype).clamp(0, 1)))
+
+                                    del con_view_attn, point_attn, point_attn_cnt
+                                    torch.cuda.empty_cache()
+
+                        with latency_logger.timeit("inference.attn_ctrl.cleanup"):
+                            for controller in controllers:
+                                controller.enable_consist()
+                            del toy_controllers
+                            torch.cuda.empty_cache()
+
+                # 8.2. forward each view
+                with latency_logger.timeit("inference.forward"):
+                    view_preds = []
+                    for idx in range(len(latents)):
                         # get latents
                         latent = latents[idx][None]
+                        clean_latent = clean_latents[idx][None]
                         source_latent = source_latents[idx][None]
                         mutual_latent = mutual_latents[idx][None]
 
                         # register the controller
-                        controller = toy_controllers[idx] ## 뷰마다 컨트롤러 등록
+                        controller = controllers[idx]
                         register_attention_control(self, controller)
 
                         # expand the latents if we are doing classifier free guidance
@@ -194,339 +313,164 @@ class EditConsistPipeline(EditPipeline):
                             dim=0,
                         )  # 0 is unconditional prompt, 1 is conditional prompt
 
-                        ## 3. U-Net 실행 (attention controller가 자동으로 attention 맵 수집)
-                        _ = self.unet(
+                        concat_noise_pred = self.unet(
                             concat_latent_model_input,
                             t,
                             cross_attention_kwargs=cross_attention_kwargs,
                             encoder_hidden_states=concat_prompt_embeds,
                         ).sample
-                    attn_unet_time += time.time() - _unet_start
 
-                    # Projection and rendering timing
-                    _proj_render_start = time.time()
-                    # project and average the attn maps
-                    attn_len = max(prompt_token_len, source_prompt_token_len)
-                    attn_dtype = concat_latent_model_input.dtype
-                    for module_name, attn_list in toy_controllers[0].consist_store.items():
-                        if len(attn_list) == 0:
-                            continue
-                        for attn_idx in tqdm(range(len(attn_list))):
-                            all_view_attn = []
-                            for idx in range(len(view_list)):
-                                view_attn = toy_controllers[idx].consist_store[module_name][attn_idx][:, :, :attn_len]
-                                attn_size = int(view_attn.shape[1] ** 0.5)
-                                view_attn = view_attn.reshape(-1, attn_size, attn_size, attn_len).permute(0, 3, 1, 2)
-                                view_attn = F.interpolate(view_attn, size=(attn_projection_resolution, attn_projection_resolution), mode="bilinear", align_corners=False)
-                                view_attn = view_attn.flatten(0, 1).to(torch.float32)
-                                all_view_attn.append(view_attn)
+                        # perform guidance
+                        (source_noise_pred_uncond, noise_pred_uncond,
+                         mutual_noise_pred_uncond, source_noise_pred_text,
+                         noise_pred_text, mutual_noise_pred_text) = concat_noise_pred.chunk(6, dim=0)
 
-                            point_attn = []
-                            point_attn_cnt = []
-                            for c_idx in range(view_attn.shape[0]):
-                                weight = torch.zeros((gaussian.get_opacity.shape[0], 1), dtype=torch.float32,
-                                                     device="cuda")
-                                weight_cnt = torch.zeros((gaussian.get_opacity.shape[0],), dtype=torch.int,
-                                                         device="cuda")
-                                for idx, view_idx in enumerate(view_list):
-                                    gaussian.apply_weights(cameras[view_idx], weight, weight_cnt,
-                                                           all_view_attn[idx][c_idx][None],
-                                                           projection_size=(attn_projection_resolution, attn_projection_resolution))
-                                point_attn.append(weight)
-                                point_attn_cnt.append(weight_cnt)
-                            point_attn = torch.cat(point_attn, dim=-1)
-                            point_attn_cnt = torch.stack(point_attn_cnt, dim=-1)
-                            point_attn = point_attn / (point_attn_cnt + 1e-8)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+                        source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
+                                source_noise_pred_text - source_noise_pred_uncond
+                        )
+                        mutual_noise_pred = mutual_noise_pred_uncond + source_guidance_scale * (
+                                mutual_noise_pred_text - mutual_noise_pred_uncond
+                        )
 
-                            del all_view_attn
-                            torch.cuda.empty_cache()
+                        # all the latents here are not used for computing
+                        _, latent, pred_x0, _ = ddcm_sampler(
+                            self.scheduler, source_latent,
+                            latent, t,
+                            source_noise_pred, noise_pred,
+                            clean_latent, noise=noise,
+                            eta=eta, to_next=False,
+                            **extra_step_kwargs
+                        )
 
-                            # rendering
-                            con_view_attn = []
-                            assert point_attn.shape[1] % 3 == 0
-                            for c_idx in range(point_attn.shape[1] // 3):
-                                point_attn_ = point_attn[:, c_idx * 3:(c_idx + 1) * 3]
-                                con_view_attn_ = []
-                                for idx, view_idx in enumerate(view_list):
-                                    con_view_attn_.append(render(cameras[view_idx], gaussian, render_pipe,
-                                                                 override_color=point_attn_,
-                                                                 bg_color=torch.tensor([0, 0, 0], dtype=torch.float32,
-                                                                                       device="cuda"))['render'])
-                                con_view_attn.append(torch.stack(con_view_attn_, dim=0))
-                            con_view_attn = torch.cat(con_view_attn, dim=1)
+                        source_latent, mutual_latent, pred_mu0, alpha_prod_t_prev = ddcm_sampler(
+                            self.scheduler, source_latent,
+                            mutual_latent, t,
+                            source_noise_pred, mutual_noise_pred,
+                            clean_latent, noise=noise,
+                            eta=eta, to_next=False,
+                            **extra_step_kwargs
+                        )
 
-                            # write to controllers
-                            con_view_attn = F.interpolate(con_view_attn, size=(attn_size, attn_size),
-                                                          mode="bilinear", align_corners=False)
-                            con_view_attn = con_view_attn.reshape(len(view_list), -1, attn_len, attn_size, attn_size
-                                                                  ).permute(0, 1, 3, 4, 2).flatten(2, 3)
-                            for idx, view_idx in enumerate(view_list):
-                                toy_controllers[idx].consist_store[module_name][attn_idx][:, :, :attn_len] = con_view_attn[idx]
-                                controllers[idx].consist_store[module_name].append(copy.deepcopy(
-                                    toy_controllers[idx].consist_store[module_name][attn_idx].to(attn_dtype).clamp(0, 1)))
+                        view_preds.append(torch.cat([pred_x0, pred_mu0], dim=1))
+                    view_preds = torch.cat(view_preds, dim=0)
 
-                            del con_view_attn, point_attn, point_attn_cnt
-                            torch.cuda.empty_cache()
-                    attn_projection_rendering_time += time.time() - _proj_render_start
-                    
-                    # Cleanup timing
-                    _cleanup_start = time.time()
                     for controller in controllers:
-                        controller.enable_consist()
-                    del toy_controllers
-                    torch.cuda.empty_cache()
-                    attn_cleanup_time += time.time() - _cleanup_start
-                    
-                    attn_ctrl_time += time.time() - _attn_start
-                    
-                    # Store detailed timing for CSV logging
-                    self._attn_unet_time = attn_unet_time
-                    self._attn_projection_rendering_time = attn_projection_rendering_time
-                    self._attn_cleanup_time = attn_cleanup_time
-                    
-                    # Log detailed cross-attention timing
-                    print(f'  Cross-Attention Detailed Timing:')
-                    print(f'    U-Net execution: {attn_unet_time:.3f}s')
-                    print(f'    Projection + Rendering: {attn_projection_rendering_time:.3f}s')
-                    print(f'    Cleanup: {attn_cleanup_time:.3f}s')
-                    print(f'    Total: {attn_ctrl_time:.3f}s')
-
-                # 8.2. forward each view
-                _forward_start = time.time()
-                view_preds = []
-                for idx in range(len(latents)):
-
-                    # get latents
-                    latent = latents[idx][None]
-                    clean_latent = clean_latents[idx][None]
-                    source_latent = source_latents[idx][None]
-                    mutual_latent = mutual_latents[idx][None]
-
-                    # register the controller
-                    controller = controllers[idx]
-                    register_attention_control(self, controller)
-
-                    # expand the latents if we are doing classifier free guidance
-                    latent_model_input = torch.cat([latent] * 2) if do_classifier_free_guidance else latent
-                    source_latent_model_input = (
-                        torch.cat([source_latent] * 2) if do_classifier_free_guidance else source_latent
-                    )
-                    mutual_latent_model_input = (
-                        torch.cat([mutual_latent] * 2) if do_classifier_free_guidance else mutual_latent
-                    )
-                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                    source_latent_model_input = self.scheduler.scale_model_input(source_latent_model_input, t)
-                    mutual_latent_model_input = self.scheduler.scale_model_input(mutual_latent_model_input, t)
-
-                    # predict the noise residual
-                    assert do_classifier_free_guidance
-                    concat_latent_model_input = torch.stack(  # source_latent is same initialized as tgt_latent
-                        [
-                            source_latent_model_input[0],
-                            latent_model_input[0],
-                            mutual_latent_model_input[0],  # mutual latents, the latent of the middle branch
-                            source_latent_model_input[1],
-                            latent_model_input[1],
-                            mutual_latent_model_input[1],  # mutual latents, which plays as a middle results
-                        ],
-                        dim=0,
-                    )  # 0 is unconditional latent, 1 is conditional latent, 0/1 is same initialized
-                    concat_prompt_embeds = torch.stack(
-                        [
-                            source_prompt_embeds[0],
-                            prompt_embeds[0],
-                            source_prompt_embeds[0],
-                            source_prompt_embeds[1],
-                            prompt_embeds[1],
-                            source_prompt_embeds[1],
-                        ],
-                        dim=0,
-                    )  # 0 is unconditional prompt, 1 is conditional prompt
-
-                    concat_noise_pred = self.unet(
-                        concat_latent_model_input,
-                        t,
-                        cross_attention_kwargs=cross_attention_kwargs,
-                        encoder_hidden_states=concat_prompt_embeds,
-                    ).sample
-
-                    # perform guidance
-                    (source_noise_pred_uncond, noise_pred_uncond,
-                     mutual_noise_pred_uncond, source_noise_pred_text,
-                     noise_pred_text, mutual_noise_pred_text) = concat_noise_pred.chunk(6, dim=0)
-
-                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
-                    source_noise_pred = source_noise_pred_uncond + source_guidance_scale * (
-                            source_noise_pred_text - source_noise_pred_uncond
-                    )
-                    mutual_noise_pred = mutual_noise_pred_uncond + source_guidance_scale * (
-                            mutual_noise_pred_text - mutual_noise_pred_uncond
-                    )
-
-                    # all the latents here are not used for computing
-                    ## -> DDCM sampler가 출력한 latent들이 다음 계산에서 사용되지 않는다
-                    # pred_x0, alpha_prod_t_prev, pred_mu0 는 추후에 사용된다
-                    
-                    _, latent, pred_x0, _ = ddcm_sampler(
-                        self.scheduler, source_latent,
-                        latent, t,
-                        source_noise_pred, noise_pred, ## Target Branch와 Source Branch를 DDCM으로 합침
-                        clean_latent, noise=noise,
-                        eta=eta, to_next=False,
-                        **extra_step_kwargs
-                    )
-
-                    # all the latents here are not used for computing
-                    source_latent, mutual_latent, pred_mu0, alpha_prod_t_prev = ddcm_sampler(
-                        self.scheduler, source_latent,
-                        mutual_latent, t,
-                        source_noise_pred, mutual_noise_pred,
-                        clean_latent, noise=noise,
-                        eta=eta, to_next=False,
-                        **extra_step_kwargs
-                    )
-
-                    view_preds.append(torch.cat([pred_x0, pred_mu0], dim=1)) # view_preds: empty []
-                view_preds = torch.cat(view_preds, dim=0)
-
-                for controller in controllers:
-                    controller.reset_consist()
-                    controller.disable_consist()
-                forward_time += time.time() - _forward_start
+                        controller.reset_consist()
+                        controller.disable_consist()
 
               
 
 
                 # 8.3. prediction consistency control
-                # ================== consist control for pred_x0 and pred_mu0 ==================
                 if (step_idx + 1) % pred_ctrl_steps == 0:
-                    _pred_start = time.time()
+                    with latency_logger.timeit("inference.pred_ctrl"):
+                        # inverse project images to 3d
+                        print(f'Prediction Consistency Control at t = {t} ...')
+                        print(f'--step 1: inverse project images to 3d ...')
+                        view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]),
+                                                    self.decode_batches(view_preds[:, 4:])], dim=1)
+                        view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32)
 
-                    # inverse project images to 3d
-                    print(f'Prediction Consistency Control at t = {t} ...')
-                    print(f'--step 1: inverse project images to 3d ...')
-                    view_img_preds = torch.cat([self.decode_batches(view_preds[:, :4]), ## latent에서 image로 디코딩
-                                                self.decode_batches(view_preds[:, 4:])], dim=1)
-                    view_img_preds = (view_img_preds / 2 + 0.5).clamp(0, 1).to(torch.float32) # rgb
+                        gaussian_color_x0 = self.mini_gaussian_training(copy.deepcopy(gaussian), view_list,
+                                                                         view_img_preds[:, :3], cameras,
+                                                                         render_pipe, perceptual_loss, minigs_epochs)
+                        gaussian_color_mu0 = self.mini_gaussian_training(copy.deepcopy(gaussian), view_list,
+                                                                         view_img_preds[:, 3:], cameras,
+                                                                         render_pipe, perceptual_loss, minigs_epochs)
 
+                        print(f'--step 2: render back to images ...')
+                        con_view_preds_x0 = []
+                        con_view_preds_mu0 = []
+                        for idx, view_idx in enumerate(view_list):
+                            x0_render_pkg = render(cameras[view_idx], gaussian_color_x0, render_pipe,
+                                                   bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))
+                            mu0_render_pkg = render(cameras[view_idx], gaussian_color_mu0, render_pipe,
+                                                    bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))
+                            con_view_preds_x0.append(x0_render_pkg['render'])
+                            con_view_preds_mu0.append(mu0_render_pkg['render'])
+                        con_view_preds_x0 = torch.stack(con_view_preds_x0, dim=0)
+                        con_view_preds_mu0 = torch.stack(con_view_preds_mu0, dim=0)
 
-
-                    gaussian_color_x0 = self.mini_gaussian_training(copy.deepcopy(gaussian), view_list,
-                                                                 view_img_preds[:, :3],  cameras,
-                                                                 render_pipe, perceptual_loss, minigs_epochs)
-                    gaussian_color_mu0 = self.mini_gaussian_training(copy.deepcopy(gaussian), view_list,
-                                                                  view_img_preds[:, 3:],  cameras,
-                                                                  render_pipe, perceptual_loss, minigs_epochs)
-                    # point_color = [point_color_x0, point_color_mu0]
-
-                    # render back to images
-                    print(f'--step 2: render back to images ...')
-                    con_view_preds_x0 = []
-                    con_view_preds_mu0 = []
-                    for idx, view_idx in enumerate(view_list):
-                        # gaussian._features_dc = point_color[0]
-                        x0_render_pkg = render(cameras[view_idx], gaussian_color_x0, render_pipe,
-                                               bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))
-                        # gaussian._features_dc = point_color[1]
-                        mu0_render_pkg = render(cameras[view_idx], gaussian_color_mu0, render_pipe,
-                                                bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))
-
-                        con_view_preds_x0.append(x0_render_pkg['render'])
-                        con_view_preds_mu0.append(mu0_render_pkg['render'])
-                        # import matplotlib.pyplot as plt
-                        # plt.imshow(render_pkg['render'].detach().cpu().numpy().transpose(1, 2, 0))
-                        # plt.show()
-                    con_view_preds_x0 = torch.stack(con_view_preds_x0, dim=0)
-                    con_view_preds_mu0 = torch.stack(con_view_preds_mu0, dim=0)
-
-                    # re-encode images to latents
-                    con_view_preds_x0 = (con_view_preds_x0 * 2 - 1).to(torch.float32).clamp(-1, 1)
-                    con_view_preds_mu0 = (con_view_preds_mu0 * 2 - 1).to(torch.float32).clamp(-1, 1)
-                    _, con_view_preds_x0 = self.prepare_latents_batches(
-                        con_view_preds_x0, latent_timestep, batch_size, num_images_per_prompt,
-                        prompt_embeds.dtype, device, denoise_model, generator
-                    )
-                    _, con_view_preds_mu0 = self.prepare_latents_batches(
-                        con_view_preds_mu0, latent_timestep, batch_size, num_images_per_prompt,
-                        prompt_embeds.dtype, device, denoise_model, generator
-                    )
-                    view_preds = torch.cat([con_view_preds_x0, con_view_preds_mu0], dim=1)
-
-                    del gaussian_color_x0, gaussian_color_mu0, con_view_preds_x0, con_view_preds_mu0
-                    torch.cuda.empty_cache()
-                    pred_ctrl_time += time.time() - _pred_start
+                        con_view_preds_x0 = (con_view_preds_x0 * 2 - 1).to(torch.float32).clamp(-1, 1)
+                        con_view_preds_mu0 = (con_view_preds_mu0 * 2 - 1).to(torch.float32).clamp(-1, 1)
+                        _, con_view_preds_x0 = self.prepare_latents_batches(
+                            con_view_preds_x0, latent_timestep, batch_size, num_images_per_prompt,
+                            prompt_embeds.dtype, device, denoise_model, generator
+                        )
+                        _, con_view_preds_mu0 = self.prepare_latents_batches(
+                            con_view_preds_mu0, latent_timestep, batch_size, num_images_per_prompt,
+                            prompt_embeds.dtype, device, denoise_model, generator
+                        )
+                        view_preds = torch.cat([con_view_preds_x0, con_view_preds_mu0], dim=1)
+                        del gaussian_color_x0, gaussian_color_mu0, con_view_preds_x0, con_view_preds_mu0
+                        torch.cuda.empty_cache()
 
                 # 8.4. blending map consistency control
-                # ================== consist control for blend maps ==================
-                _blend_start = time.time()
-                maps = []
-                for idx, view_idx in enumerate(view_list):
-                    maps.append(controllers[idx].local_blend.get_blend_maps(controllers[idx].attention_store,
-                                                                            view_preds.shape[-2], view_preds.shape[-1]))
-                maps = torch.cat(maps, dim=0)
-
-                if (step_idx + 1) % blend_ctrl_steps == 0:
-                    print(f'Blend Cross-Attention Consistency Control at t = {t} ...')
-                    print(f'--step 1: inverse project maps to 3d ...')
-                    maps = F.interpolate(maps, size=(attn_projection_resolution, attn_projection_resolution))
-                    point_maps = []
-                    point_maps_cnt = []
-                    for c_idx in range(maps.shape[1]):
-                        weight = torch.zeros((gaussian.get_opacity.shape[0], 1), dtype=torch.float32, device="cuda")
-                        weight_cnt = torch.zeros((gaussian.get_opacity.shape[0],), dtype=torch.int, device="cuda")
-                        for idx, view_idx in enumerate(view_list):
-                            gaussian.apply_weights(cameras[view_idx], weight, weight_cnt, maps[idx][c_idx][None],
-                                                   projection_size=(attn_projection_resolution, attn_projection_resolution))
-                        point_maps.append(weight)
-                        point_maps_cnt.append(weight_cnt)
-                    point_maps = torch.cat(point_maps, dim=-1)
-                    point_maps_cnt = torch.stack(point_maps_cnt, dim=-1)
-                    point_maps = point_maps / (point_maps_cnt + 1e-8)
-
-                    print(f'--step 2: render back to maps ...')
+                with latency_logger.timeit("inference.blend_ctrl"):
                     maps = []
                     for idx, view_idx in enumerate(view_list):
-                        maps.append(render(cameras[view_idx], gaussian, render_pipe, override_color=point_maps,
-                                           bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))['render'])
+                        maps.append(controllers[idx].local_blend.get_blend_maps(controllers[idx].attention_store,
+                                                                               view_preds.shape[-2], view_preds.shape[-1]))
+                    maps = torch.cat(maps, dim=0)
 
-                    maps = F.interpolate(torch.stack(maps, dim=0), size=(view_preds.shape[-2], view_preds.shape[-1]))
-                blend_ctrl_time += time.time() - _blend_start
+                    if (step_idx + 1) % blend_ctrl_steps == 0:
+                        print(f'Blend Cross-Attention Consistency Control at t = {t} ...')
+                        print(f'--step 1: inverse project maps to 3d ...')
+                        maps = F.interpolate(maps, size=(attn_projection_resolution, attn_projection_resolution))
+                        point_maps = []
+                        point_maps_cnt = []
+                        for c_idx in range(maps.shape[1]):
+                            weight = torch.zeros((gaussian.get_opacity.shape[0], 1), dtype=torch.float32, device="cuda")
+                            weight_cnt = torch.zeros((gaussian.get_opacity.shape[0],), dtype=torch.int, device="cuda")
+                            for idx, view_idx in enumerate(view_list):
+                                gaussian.apply_weights(cameras[view_idx], weight, weight_cnt, maps[idx][c_idx][None])
+                            point_maps.append(weight)
+                            point_maps_cnt.append(weight_cnt)
+                        point_maps = torch.cat(point_maps, dim=-1)
+                        point_maps_cnt = torch.stack(point_maps_cnt, dim=-1)
+                        point_maps = point_maps / (point_maps_cnt + 1e-8)
+
+                        print(f'--step 2: render back to maps ...')
+                        maps = []
+                        for idx, view_idx in enumerate(view_list):
+                            maps.append(render(cameras[view_idx], gaussian, render_pipe, override_color=point_maps,
+                                              bg_color=torch.tensor([0, 0, 0], dtype=torch.float32, device="cuda"))['render'])
+                        maps = F.interpolate(torch.stack(maps, dim=0), size=(view_preds.shape[-2], view_preds.shape[-1]))
 
                 # 8.5. update latents and call callback
-                # ================== update latents and call callback ==================
                 print(f'Update Latents & Callback at t = {t} ...')
-                _update_start = time.time()
-                latents = []
-                mutual_latents = []
-                source_latents = []
+                with latency_logger.timeit("inference.update"):
+                    latents = []
+                    mutual_latents = []
+                    source_latents = []
 
-                for idx, view_idx in enumerate(view_list):
-                    callback = callbacks[idx] if callbacks is not None else None
-                    map = maps[idx][None] if callbacks is not None else None
+                    for idx, view_idx in enumerate(view_list):
+                        callback = callbacks[idx] if callbacks is not None else None
+                        map = maps[idx][None] if callbacks is not None else None
 
-                    pred_x0 = view_preds[idx][None][:, :4]
-                    pred_mu0 = view_preds[idx][None][:, 4:]
-                    x0 = clean_latents[idx][None]
+                        pred_x0 = view_preds[idx][None][:, :4]
+                        pred_mu0 = view_preds[idx][None][:, 4:]
+                        x0 = clean_latents[idx][None]
 
-                    latent = alpha_prod_t_prev ** (0.5) * pred_x0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
-                    mutual_latent = alpha_prod_t_prev ** (0.5) * pred_mu0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
-                    source_latent = alpha_prod_t_prev ** (0.5) * x0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
+                        latent = alpha_prod_t_prev ** (0.5) * pred_x0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
+                        mutual_latent = alpha_prod_t_prev ** (0.5) * pred_mu0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
+                        source_latent = alpha_prod_t_prev ** (0.5) * x0 + (1 - alpha_prod_t_prev) ** 0.5 * noise
 
-                    # call the callback, if provided
-                    if step_idx == len(timesteps) - 1 or ((step_idx + 1) > num_warmup_steps
-                                                          and (step_idx + 1) % self.scheduler.order == 0):
-                        if callback is not None and step_idx % callback_steps == 0:
-                            alpha_prod_t = self.scheduler.alphas_cumprod[t]
-                            mutual_latent, latent = callback(step_idx, t, source_latent, latent, mutual_latent,
-                                                             alpha_prod_t, maps=map)
+                        if step_idx == len(timesteps) - 1 or ((step_idx + 1) > num_warmup_steps
+                                                              and (step_idx + 1) % self.scheduler.order == 0):
+                            if callback is not None and step_idx % callback_steps == 0:
+                                alpha_prod_t = self.scheduler.alphas_cumprod[t]
+                                mutual_latent, latent = callback(step_idx, t, source_latent, latent, mutual_latent,
+                                                                  alpha_prod_t, maps=map)
 
-                    latents.append(latent)
-                    mutual_latents.append(mutual_latent)
-                    source_latents.append(source_latent)
+                        latents.append(latent)
+                        mutual_latents.append(mutual_latent)
+                        source_latents.append(source_latent)
 
-                latents = torch.cat(latents, dim=0)
-                mutual_latents = torch.cat(mutual_latents, dim=0)
-                source_latents = torch.cat(source_latents, dim=0)
+                    latents = torch.cat(latents, dim=0)
+                    mutual_latents = torch.cat(mutual_latents, dim=0)
+                    source_latents = torch.cat(source_latents, dim=0)
                 all_pred_x0 = view_preds[:, :4]
 
                 print(f'Finished t = {t}.')
@@ -535,45 +479,6 @@ class EditConsistPipeline(EditPipeline):
 
                 del maps, view_preds
                 torch.cuda.empty_cache()
-
-                # write per-iteration timing ratios
-                update_time += time.time() - _update_start
-                iter_total_time = time.time() - iter_start_time
-                accounted = attn_ctrl_time + forward_time + pred_ctrl_time + blend_ctrl_time + update_time
-                other_time = max(0.0, iter_total_time - accounted)
-
-                timing_dir = os.environ.get("VCEDIT_TIMING_DIR", None)
-                if timing_dir is None:
-                    # fallback: try to use threestudio trial_dir if available via system attribute, else CWD
-                    try:
-                        timing_dir = getattr(self, "trial_dir", os.getcwd())
-                    except Exception:
-                        timing_dir = os.getcwd()
-                try:
-                    os.makedirs(timing_dir, exist_ok=True)
-                    iter_csv = os.path.join(timing_dir, "timings_iter.csv")
-                    write_header = not os.path.exists(iter_csv)
-                    with open(iter_csv, "a") as f:
-                        if write_header:
-                            f.write("step,t,iter_total,attn_ctrl,attn_unet,attn_projection_rendering,attn_cleanup,forward,pred_ctrl,blend_ctrl,update,other,attn_ratio,attn_unet_ratio,attn_projection_rendering_ratio,attn_cleanup_ratio,forward_ratio,pred_ratio,blend_ratio,update_ratio,other_ratio\n")
-                        # compute ratios
-                        def r(x):
-                            return (x / iter_total_time) if iter_total_time > 0 else 0.0
-                        # Get detailed attn timing if available
-                        attn_unet_time = getattr(self, '_attn_unet_time', 0.0)
-                        attn_projection_rendering_time = getattr(self, '_attn_projection_rendering_time', 0.0)
-                        attn_cleanup_time = getattr(self, '_attn_cleanup_time', 0.0)
-                        
-                        line = (
-                            f"{step_idx},{int(t)},"
-                            f"{iter_total_time:.6f},{attn_ctrl_time:.6f},{attn_unet_time:.6f},{attn_projection_rendering_time:.6f},{attn_cleanup_time:.6f},"
-                            f"{forward_time:.6f},{pred_ctrl_time:.6f},{blend_ctrl_time:.6f},{update_time:.6f},{other_time:.6f},"
-                            f"{r(attn_ctrl_time):.6f},{r(attn_unet_time):.6f},{r(attn_projection_rendering_time):.6f},{r(attn_cleanup_time):.6f},"
-                            f"{r(forward_time):.6f},{r(pred_ctrl_time):.6f},{r(blend_ctrl_time):.6f},{r(update_time):.6f},{r(other_time):.6f}\n"
-                        )
-                        f.write(line)
-                except Exception as _:
-                    pass
 
         # 9. Post-processing
         if not output_type == "latent":
@@ -592,53 +497,9 @@ class EditConsistPipeline(EditPipeline):
         if not return_dict:
             return image
 
-        # write final aggregate timing summary by reading the per-iteration CSV
         try:
-            timing_dir = os.environ.get("VCEDIT_TIMING_DIR", None)
-            if timing_dir is None:
-                try:
-                    timing_dir = getattr(self, "trial_dir", os.getcwd())
-                except Exception:
-                    timing_dir = os.getcwd()
-            iter_csv = os.path.join(timing_dir, "timings_iter.csv")
-            summary_txt = os.path.join(timing_dir, "timings_summary.txt")
-            if os.path.exists(iter_csv):
-                total = 0.0
-                attn = attn_unet = attn_projection_rendering = attn_cleanup = 0.0
-                forward = pred = blend = update_sum = other = 0.0
-                with open(iter_csv, "r") as f:
-                    header = True
-                    for line in f:
-                        if header:
-                            header = False
-                            continue
-                        parts = line.strip().split(",")
-                        if len(parts) < 19:  # Updated for new CSV format
-                            continue
-                        total += float(parts[2])
-                        attn += float(parts[3])
-                        attn_unet += float(parts[4])
-                        attn_projection_rendering += float(parts[5])
-                        attn_cleanup += float(parts[6])
-                        forward += float(parts[7])
-                        pred += float(parts[8])
-                        blend += float(parts[9])
-                        update_sum += float(parts[10])
-                        other += float(parts[11])
-                denom = max(total, 1e-8)
-                with open(summary_txt, "w") as f:
-                    f.write("Final Timing Summary (seconds and ratios)\n")
-                    f.write(f"total={total:.6f}\n")
-                    f.write(f"attn_ctrl={attn:.6f}, ratio={attn/denom:.6f}\n")
-                    f.write(f"  attn_unet={attn_unet:.6f}, ratio={attn_unet/denom:.6f}\n")
-                    f.write(f"  attn_projection_rendering={attn_projection_rendering:.6f}, ratio={attn_projection_rendering/denom:.6f}\n")
-                    f.write(f"  attn_cleanup={attn_cleanup:.6f}, ratio={attn_cleanup/denom:.6f}\n")
-                    f.write(f"forward={forward:.6f}, ratio={forward/denom:.6f}\n")
-                    f.write(f"pred_ctrl={pred:.6f}, ratio={pred/denom:.6f}\n")
-                    f.write(f"blend_ctrl={blend:.6f}, ratio={blend/denom:.6f}\n")
-                    f.write(f"update={update_sum:.6f}, ratio={update_sum/denom:.6f}\n")
-                    f.write(f"other={other:.6f}, ratio={other/denom:.6f}\n")
-        except Exception as _:
+            latency_logger.write_summary("timings_summary.txt")
+        except Exception:
             pass
 
         return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=nsfw_content_detected)

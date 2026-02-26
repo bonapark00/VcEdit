@@ -28,9 +28,18 @@ try:
 except ImportError:
     TENSORBOARD_FOUND = False
 
+try:
+    _train_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), ".."))
+    if _train_dir not in sys.path:
+        sys.path.insert(0, _train_dir)
+    from threestudio.utils.latency import LatencyLogger
+except ImportError:
+    LatencyLogger = None
+
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
+    latency_logger = LatencyLogger(dataset.model_path) if LatencyLogger else None
     gaussians = GaussianModel(dataset.sh_degree)
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
@@ -41,8 +50,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     bg_color = [1, 1, 1] if dataset.white_background else [0, 0, 0]
     background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
-    iter_start = torch.cuda.Event(enable_timing = True)
-    iter_end = torch.cuda.Event(enable_timing = True)
+    iter_start = torch.cuda.Event(enable_timing=True)
+    iter_end = torch.cuda.Event(enable_timing=True)
 
     viewpoint_stack = None
     ema_loss_for_log = 0.0
@@ -101,7 +110,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 progress_bar.close()
 
             # Log and save
-            training_report(tb_writer, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background))
+            elapsed_ms = iter_start.elapsed_time(iter_end)
+            if latency_logger is not None:
+                latency_logger.record("iteration", elapsed_ms / 1000.0)
+            training_report(tb_writer, iteration, Ll1, loss, l1_loss, elapsed_ms, testing_iterations, scene, render, (pipe, background))
             if (iteration in saving_iterations):
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -127,6 +139,12 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if (iteration in checkpoint_iterations):
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+    if latency_logger is not None:
+        try:
+            latency_logger.write_summary("training_latency_summary.txt")
+        except Exception:
+            pass
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

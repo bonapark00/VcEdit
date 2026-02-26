@@ -5,7 +5,6 @@ import time
 import viser
 import viser.transforms as tf
 from omegaconf import OmegaConf
-from collections import deque
 
 from gaussiansplatting.scene.cameras import Simple_Camera, C2W_Camera
 from gaussiansplatting.gaussian_renderer import render
@@ -51,7 +50,6 @@ class ViserViewer:
 
         self.train_mode = train_mode
 
-        self.render_times = deque(maxlen=3)
         self.server = viser.ViserServer(port=self.port)
         self.reset_view_button = self.server.add_gui_button("Reset View")
 
@@ -179,16 +177,12 @@ class ViserViewer:
     @torch.no_grad()
     def update(self):
         if self.need_update:
-            times = []
             for client in self.server.get_clients().values():
                 camera = client.camera
                 w = self.resolution_slider.value
                 h = int(w / camera.aspect)
-                # cam = Simple_Camera(0, )
                 cam = C2W_Camera(get_c2w(camera), camera.fov, h, w)
-                # c2w = torch.from_numpy(get_c2w(camera)).to(self.device)
                 try:
-                    start = time.time()
                     out = render(
                         cam,
                         self.system.gaussian,
@@ -204,8 +198,6 @@ class ViserViewer:
                         .numpy()
                         * 255.0
                     ).astype(np.uint8)
-                    end = time.time()
-                    times.append(end - start)
                 except RuntimeError as e:
                     print(e)
                     continue
@@ -213,8 +205,7 @@ class ViserViewer:
                 client.set_background_image(out, format="jpeg")
                 del out
 
-            self.render_times.append(np.mean(times))
-            self.fps.value = f"{1.0 / np.mean(self.render_times):.3g}"
+            self.fps.value = "—"
 
     def render_loop(self):
         while True:

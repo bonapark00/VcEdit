@@ -42,6 +42,7 @@ class InfEditGuidance(BaseObject):
         attn_ctrl_steps: int = 7
         pred_ctrl_steps: int = 5
         blend_ctrl_steps: int = 1
+        attn_projection_resolution: int = 512
         minigs_epochs: int = 6
 
         skip_first_ctrl: bool = False
