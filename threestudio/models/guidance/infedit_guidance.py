@@ -129,10 +129,13 @@ class InfEditGuidance(BaseObject):
         **kwargs,
     ):
         batch_size = len(rgb)
-        _, H, W, _ = rgb[0].shape
+        # rgb is dict[view_id -> tensor]; get H,W from first value
+        first_val = next(iter(rgb.values()))
+        _, H, W, _ = first_val.shape
         assert H == 512 and W == 512, "Image size must be 512x512"
 
-        rgb = torch.cat([v.permute(0, 3, 1, 2) for _, v in rgb.items()], dim=0)
+        # concatenate in view_list order so edit_images[idx] matches view_list[idx]
+        rgb = torch.cat([rgb[view_idx].permute(0, 3, 1, 2) for view_idx in view_list], dim=0)
         # rgb = rgb.permute(0, 3, 1, 2)
 
         if calling_idx > 0:
