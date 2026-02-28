@@ -608,6 +608,13 @@ class GaussianEditor(BaseLift3DSystem):
                     "kwargs": {"data_format": "HWC"},
                 },
             )
+            # Save each edited image individually (view index = index)
+            self.save_rgb_image(
+                f"edited_images/{index:04d}.png",
+                image[0],
+                data_format="HWC",
+                data_range=(0, 1),
+            )
         if len(save_list) > 0:
             self.save_image_grid(
                 f"edited_images.png",

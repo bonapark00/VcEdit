@@ -14,7 +14,8 @@ system.densify_from_iter=100 \
 system.densify_until_iter=1501 \
 system.densification_interval=100 \
 data.source=/data/users/jaeyeonpark/dataset/3d-ovs/covered_desk \
-system.gs_source=/data/users/jaeyeonpark/3dgs-trained/3d-ovs/covered_desk/point_cloud/iteration_30000/point_cloud.ply \
+data.source=/data/users/jaeyeonpark/dataset/in2n-GSEditor/face \
+system.gs_source=/data/users/jaeyeonpark/3dgs-trained/in2n-GSEditor/face/point_cloud/iteration_30000/point_cloud.ply \
 system.guidance.src_prompt="face" \
 system.guidance.tgt_prompt="elf" \
 system.prompt_processor.prompt="elf" \
@@ -27,3 +28,5 @@ system.per_editing_step=400 \
 data.max_view_num=20 \
 system.guidance.skip_first_ctrl=False
 # max_view_num 원래는 96 씀!!
+# data.source=/data/users/jaeyeonpark/dataset/3d-ovs/covered_desk \
+# system.gs_source=/data/users/jaeyeonpark/3dgs-trained/3d-ovs/covered_desk/point_cloud/iteration_30000/point_cloud.ply \
