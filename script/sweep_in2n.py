@@ -57,15 +57,16 @@ DEVICE = "cuda"
 # ==========================
 
 TASKS = [
- # 1) Change the man's fleece color to dark green
+
+    # 0) Turn the man into a clown
     {
-        "name": "fleece_dark_green",
+        "name": "man_to_clown",
         "DATA_NAME": "face",
-        "PROMPT": "Change the color of his fleece jacket to dark green",
-        "SEG_PROMPT": "grey fleece jacket",
-        "TARGET_PROMPT": "dark green fleece jacket",
-        "STYLE_SOURCE_PROMPT": "man wearing jacket with grey speckled fleece fabric",
-        "STYLE_TARGET_PROMPT": "man wearing jacket with dark green textured fleece fabric",
+        "PROMPT": "Turn the man's face into a clown",
+        "SEG_PROMPT": "face of the man",
+        "TARGET_PROMPT": "face of the clown",
+        "STYLE_SOURCE_PROMPT": "face of the man",
+        "STYLE_TARGET_PROMPT": "face of the clown",
     },
     # 2) Change the man's hair color to dark brown
     {
@@ -78,24 +79,24 @@ TASKS = [
         "STYLE_TARGET_PROMPT": "man with dark brown hair",
     },
     # 3) Make the man's mouth smile
-    {
-        "name": "mouth_smile",
-        "DATA_NAME": "face",
-        "PROMPT": "Make his mouth smile",
-        "SEG_PROMPT": "the man's mouth",
-        "TARGET_PROMPT": "the man's mouth in a smiling pose",
-        "STYLE_SOURCE_PROMPT": "man with neutral, closed mouth",
-        "STYLE_TARGET_PROMPT": "man with open, smiling mouth",
-    },
+    # {
+    #     "name": "mouth_smile",
+    #     "DATA_NAME": "face",
+    #     "PROMPT": "Make his mouth smile",
+    #     "SEG_PROMPT": "the man's mouth",
+    #     "TARGET_PROMPT": "the man's mouth in a smiling pose",
+    #     "STYLE_SOURCE_PROMPT": "man with neutral, closed mouth",
+    #     "STYLE_TARGET_PROMPT": "man with open, smiling mouth",
+    # },
     # 4) Make him wear sunglasses
     {
         "name": "wear_sunglasses",
         "DATA_NAME": "face",
-        "PROMPT": "Make him wear sunglasses",
-        "SEG_PROMPT": "the man's eyes and nose bridge",
-        "TARGET_PROMPT": "the man's eyes covered by dark sunglasses",
-        "STYLE_SOURCE_PROMPT": "man with eyes, open and visible",
-        "STYLE_TARGET_PROMPT": "man with dark sunglasses over the man's visible eyes",
+        "PROMPT": "Make him wear sunglasses on his face",
+        "SEG_PROMPT": "face of the man",
+        "TARGET_PROMPT": "face of the man with dark sunglasses",
+        "STYLE_SOURCE_PROMPT": "face of the man",
+        "STYLE_TARGET_PROMPT": "face of the man with dark sunglasses",
     },
     # 5) Make his ear like an elf's ear
     {
@@ -148,15 +149,15 @@ TASKS = [
         "STYLE_TARGET_PROMPT": "man wearing jacket with classic blue denim twill fabric",
     },
     # 10) Add a graphic of a compass to the sleeve
-    {
-        "name": "sleeve_compass",
-        "DATA_NAME": "face",
-        "PROMPT": "Add a graphic of a compass to the left sleeve of his fleece",
-        "SEG_PROMPT": "fleece fabric of the left sleeve",
-        "TARGET_PROMPT": "fleece sleeve with a small black compass graphic added",
-        "STYLE_SOURCE_PROMPT": "man wearing jacket with plain grey speckled fleece fabric",
-        "STYLE_TARGET_PROMPT": "man wearing jacket with plain grey fleece fabric with a detailed compass graphic",
-    },
+    # {
+    #     "name": "sleeve_compass",
+    #     "DATA_NAME": "face",
+    #     "PROMPT": "Add a graphic of a compass to the left sleeve of his fleece",
+    #     "SEG_PROMPT": "fleece fabric of the left sleeve",
+    #     "TARGET_PROMPT": "fleece sleeve with a small black compass graphic added",
+    #     "STYLE_SOURCE_PROMPT": "man wearing jacket with plain grey speckled fleece fabric",
+    #     "STYLE_TARGET_PROMPT": "man wearing jacket with plain grey fleece fabric with a detailed compass graphic",
+    # },
     # 11) Change his hair style to a short, cropped style
     {
         "name": "hair_style_short",
@@ -280,15 +281,15 @@ TASKS = [
         "STYLE_TARGET_PROMPT": "bear statue with stack of shiny gold bars",
     },
     # 8) Cover the entire statue with a layer of fuzzy green moss
-    {
-        "name": "statue_mossy",
-        "DATA_NAME": "bear",
-        "PROMPT": "Cover the bear statue with a layer of fuzzy green moss",
-        "SEG_PROMPT": "entire bear statue",
-        "TARGET_PROMPT": "bear statue covered in green moss",
-        "STYLE_SOURCE_PROMPT": "bear statue with clean stone texture",
-        "STYLE_TARGET_PROMPT": "bear statue with mossy green fuzzy texture",
-    },
+    # {
+    #     "name": "statue_mossy",
+    #     "DATA_NAME": "bear",
+    #     "PROMPT": "Cover the bear statue with a layer of fuzzy green moss",
+    #     "SEG_PROMPT": "entire bear statue",
+    #     "TARGET_PROMPT": "bear statue covered in green moss",
+    #     "STYLE_SOURCE_PROMPT": "bear statue with clean stone texture",
+    #     "STYLE_TARGET_PROMPT": "bear statue with mossy green fuzzy texture",
+    # },
     # 9) Add a small, fabric backpack to the back area of the bear
     {
         "name": "back_backpack",
@@ -300,15 +301,15 @@ TASKS = [
         "STYLE_TARGET_PROMPT": "bear statue with fleece back with a small fabric backpack",
     },
     # 10) Replace the background plants with a detailed city skyline
-    {
-        "name": "background_city",
-        "DATA_NAME": "bear",
-        "PROMPT": "Replace the background plants with a city skyline",
-        "SEG_PROMPT": "plants and dirt background ground",
-        "TARGET_PROMPT": "background showing a city skyline and concrete pavement",
-        "STYLE_SOURCE_PROMPT": "background with soil, leaves, and green foliage",
-        "STYLE_TARGET_PROMPT": "background with pavement, buildings, and clear city view",
-    },
+    # {
+    #     "name": "background_city",
+    #     "DATA_NAME": "bear",
+    #     "PROMPT": "Replace the background plants with a city skyline",
+    #     "SEG_PROMPT": "plants and dirt background ground",
+    #     "TARGET_PROMPT": "background showing a city skyline and concrete pavement",
+    #     "STYLE_SOURCE_PROMPT": "background with soil, leaves, and green foliage",
+    #     "STYLE_TARGET_PROMPT": "background with pavement, buildings, and clear city view",
+    # },
     # 11) Change the color of the front paws to solid gold
     {
         "name": "paws_gold",
@@ -320,15 +321,15 @@ TASKS = [
         "STYLE_TARGET_PROMPT": "bear statue with metallic gold color",
     },
     # 12) Add clear text that says 'GRIZZLY' below the statue on the rock face
-    {
-        "name": "text_grizzly",
-        "DATA_NAME": "bear",
-        "PROMPT": "Add text that says 'GRIZZLY' below the statue on the rock",
-        "SEG_PROMPT": "flat surface of the rock pedestal",
-        "TARGET_PROMPT": "rock pedestal with 'GRIZZLY' text",
-        "STYLE_SOURCE_PROMPT": "rock pedestal with plain rock surface",
-        "STYLE_TARGET_PROMPT": "rock pedestal with rock surface with detailed black block text",
-    },
+    # {
+    #     "name": "text_grizzly",
+    #     "DATA_NAME": "bear",
+    #     "PROMPT": "Add text that says 'GRIZZLY' below the statue on the rock",
+    #     "SEG_PROMPT": "flat surface of the rock pedestal",
+    #     "TARGET_PROMPT": "rock pedestal with 'GRIZZLY' text",
+    #     "STYLE_SOURCE_PROMPT": "rock pedestal with plain rock surface",
+    #     "STYLE_TARGET_PROMPT": "rock pedestal with rock surface with detailed black block text",
+    # },
 ]
 
 TASKS_BY_NAME = {t["name"]: t for t in TASKS}
